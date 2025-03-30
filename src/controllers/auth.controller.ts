@@ -1,78 +1,74 @@
+import axios from 'axios';
+import CryptoJS from 'crypto-js';
+import prisma from '../lib/prisma';
 import { Request, Response } from 'express';
-import { AuthService } from '../services/auth.service';
-import { successResponse, errorResponse } from '../utils/apiResponse';
+import dotenv from 'dotenv'
+dotenv.config()
+const SECRET_KEY = process.env.SECRET_KEY;
 
-export const AuthController = {
-  async register(req: Request, res: Response) {
-    try {
-      const { email, password, firstName, lastName, wealthboxApiToken } = req.body;
-      
-      const user = await AuthService.register({ 
-        email, 
-        password, 
-        firstName, 
-        lastName,
-        wealthboxApiToken 
-      });
-      
-      const token = AuthService.generateToken(user.id);
-      
-      successResponse(res, { 
-        user, 
-        token,
-        isWealthboxAuthenticated: user.isWealthboxAuthenticated 
-      }, 'User registered successfully');
-    } catch (error) {
-      errorResponse(res, 'Registration failed', 400, error);
-    }
-  },
+if (!SECRET_KEY) {
+  throw new Error('ENCRYPT_SECRET is missing from environment variables.');
+}
 
-  async login(req: Request, res: Response) {
-    try {
-      const { email, password, wealthboxApiToken } = req.body;
-      
-      if ((!email || !password) && !wealthboxApiToken) {
-        return errorResponse(res, 'Either email/password or Wealthbox token is required', 400);
-      }
 
-      const { user, token } = await AuthService.login(
-        email, 
-        password, 
-        wealthboxApiToken
-      );
-      
-      successResponse(res, { 
-        user, 
-        token,
-        isWealthboxAuthenticated: user.isWealthboxAuthenticated  ?? false
-      }, 'Login successful');
-    } catch (error) {
-      errorResponse(res, 'Login failed', 401, error);
-    }
-  },
+export const storeApiToken = async (req: Request, res: Response) => {
+  const { token } = req.body;
 
-  async connectWealthbox(req: Request, res: Response) {
-    try {
-      const userId = (req as any).user.id;
-      const { apiToken } = req.body;
-      
-      if (!apiToken) {
-        return errorResponse(res, 'Wealthbox API token is required', 400);
-      }
+  console.log('Received request to store API token');
 
-      const user = await AuthService.updateWealthboxToken(userId, apiToken);
-      successResponse(res, user, 'Wealthbox connected successfully');
-    } catch (error) {
-      errorResponse(res, 'Failed to connect Wealthbox', 400, error);
-    }
-  },
+  try {
+    console.log('Fetching user details from Wealthbox API');
+    const meRes = await axios.get('https://api.crmworkspace.com/v1/me', {
+      headers: { 'ACCESS_TOKEN': token },
+    });
 
-  async getCurrentUser(req: Request, res: Response) {
-    try {
-      const user = (req as any).user;
-      successResponse(res, user);
-    } catch (error) {
-      errorResponse(res, 'Failed to get current user', 500, error);
-    }
+    console.log('User details fetched successfully');
+    const { current_user, accounts } = meRes.data;
+    const wealthboxUserId = current_user.id;
+    const email = current_user.email;
+    const name = current_user.name;
+    const accountId = accounts[0].id;
+    const accountName = accounts[0].name;
+
+    console.log(`Upserting organization with externalId: ${accountId}`);
+    const organization = await prisma.organization.upsert({
+      where: { externalId: accountId },
+      update: { name: accountName },
+      create: { name: accountName, externalId: accountId },
+    });
+
+    console.log(`Upserting user with email: ${email}`);
+    const user = await prisma.user.upsert({
+      where: { email },
+      update: {},
+      create: {
+        email,
+        name,
+        wealthboxUserId,
+        organizationId: organization.id,
+      },
+    });
+
+    console.log('Encrypting API token');
+    const encryptedToken = CryptoJS.AES.encrypt(token, SECRET_KEY).toString();
+
+    console.log(`Upserting integration config for organizationId: ${organization.id}`);
+    await prisma.integrationConfig.upsert({
+      where: { organizationId: organization.id },
+      update: { apiToken: encryptedToken },
+      create: {
+        organizationId: organization.id,
+        apiToken: encryptedToken,
+      },
+    });
+
+    console.log('API token stored successfully');
+    res.status(200).json({
+      success: true,
+      organizationId: organization.id,
+    });
+  } catch (err) {
+    console.error('Failed to store token:', err);
+    res.status(500).json({ error: 'Failed to store token' });
   }
 };
